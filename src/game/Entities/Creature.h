@@ -644,7 +644,7 @@ class Creature : public Unit
         bool CanSwim() const override { return (GetCreatureInfo()->InhabitType & INHABIT_WATER) != 0; }
         bool IsSwimming() const { return m_movementInfo.HasMovementFlag(MOVEFLAG_SWIMMING); }
         bool CanFly() const override { return (GetCreatureInfo()->InhabitType & INHABIT_AIR) || m_movementInfo.HasMovementFlag((MovementFlags)(MOVEFLAG_LEVITATING | MOVEFLAG_HOVER | MOVEFLAG_CAN_FLY)); }
-        bool IsFlying() const override { return m_movementInfo.HasMovementFlag((MovementFlags)(MOVEFLAG_FLYING | MOVEFLAG_HOVER | MOVEFLAG_LEVITATING)); }
+        bool IsFlying() const override { return m_movementInfo.HasMovementFlag((MovementFlags)(MOVEFLAG_HOVER | MOVEFLAG_LEVITATING)); }
         bool IsTrainerOf(Player* pPlayer, bool msg) const;
         bool CanInteractWithBattleMaster(Player* pPlayer, bool msg) const;
         bool CanTrainAndResetTalentsOf(Player* pPlayer) const;
@@ -907,6 +907,8 @@ class Creature : public Unit
         void RegisterHitBySpell(uint32 spellId);
         void ResetSpellHitCounter();
 
+        uint32 GetNextUpdateTime() override;
+
         HighGuid GetParentHigh() const override { return HIGHGUID_UNIT; }
 
         void Heartbeat() override;
@@ -938,6 +940,9 @@ class Creature : public Unit
         void SetMountInfo(CreatureInfo const* info) override;
 
         void SetModelRunSpeed(float runSpeed) override { m_modelRunSpeed = runSpeed; }
+
+        void SetDelayedPetSpells() { m_delayedPetSpells = true; }
+        void TriggerDelayedPetSpells();
 
         bool IsCombatOnlyStealth() const { return m_combatOnlyStealth; }
         void SetCombatOnlyStealth(bool state) { m_combatOnlyStealth = state; }
@@ -1018,6 +1023,8 @@ class Creature : public Unit
         ObjectGuid m_killer;
 
         bool m_imposedCooldown;
+
+        bool m_delayedPetSpells;
 
         float m_healthMultiplier;
         float m_damageMultiplier;

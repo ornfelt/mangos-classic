@@ -42,6 +42,8 @@
 #include "Tools/Formulas.h"
 #include "Groups/Group.h"
 #include "Guilds/Guild.h"
+#include "GMTickets/GMTicketMgr.h"
+#include "AuctionHouse/AuctionHouseMgr.h"
 #include "Guilds/GuildMgr.h"
 #include "Entities/Pet.h"
 #include "Util/Util.h"
@@ -387,14 +389,19 @@ void TradeData::SetItem(TradeSlots slot, Item* item)
     ObjectGuid itemGuid = item ? item->GetObjectGuid() : ObjectGuid();
 
     if (m_items[slot] == itemGuid)
+    {
+        Update(false);                                      // the client drops the updates of its offer sent before this request
         return;
+    }
 
     m_items[slot] = itemGuid;
 
     SetAccepted(false);
     GetTraderData()->SetAccepted(false);
 
-    Update();
+    ++m_serverStateIndex;
+    Update(true);
+    Update(false);
 
     // need remove possible trader spell applied to changed item
     if (slot == TRADE_SLOT_NONTRADED)
@@ -417,6 +424,7 @@ void TradeData::SetSpell(uint32 spell_id, Item* castItem /*= nullptr*/)
     SetAccepted(false);
     GetTraderData()->SetAccepted(false);
 
+    ++m_serverStateIndex;
     Update(true);                                           // send spell info to item owner
     Update(false);                                          // send spell info to caster self
 }
@@ -424,7 +432,10 @@ void TradeData::SetSpell(uint32 spell_id, Item* castItem /*= nullptr*/)
 void TradeData::SetMoney(uint32 money)
 {
     if (m_money == money)
+    {
+        Update(false);                                      // the client drops the updates of its offer sent before this request
         return;
+    }
 
     if (money > m_player->GetMoney())
     {
@@ -440,7 +451,9 @@ void TradeData::SetMoney(uint32 money)
     SetAccepted(false);
     GetTraderData()->SetAccepted(false);
 
-    Update();
+    ++m_serverStateIndex;
+    Update(true);
+    Update(false);
 }
 
 void TradeData::Update(bool for_trader /*= true*/) const
@@ -488,6 +501,7 @@ Player::Player(WorldSession* session): Unit(), m_taxiTracker(*this), m_mover(thi
     m_session = session;
 
     m_ExtraFlags = 0;
+    m_flyMode = false;
     if (GetSession()->GetSecurity() >= SEC_GAMEMASTER)
         SetAcceptTicket(true);
 
@@ -562,9 +576,7 @@ Player::Player(WorldSession* session): Unit(), m_taxiTracker(*this), m_mover(thi
     m_deathTimer = 0;
     m_deathExpireTime = 0;
 
-    m_swingErrorMsg = 0;
-
-    m_DetectInvTimer = 1 * IN_MILLISECONDS;
+    m_swingErrorMsg = SWING_ERROR_NONE;
 
     m_LFGAreaId = 0;
 
@@ -1535,21 +1547,6 @@ void Player::Update(const uint32 diff)
             m_nextSave -= diff;
     }
 
-    // Handle detect stealth players
-    if (m_DetectInvTimer > 0)
-    {
-        if (diff >= m_DetectInvTimer)
-        {
-#ifdef ENABLE_PLAYERBOTS
-            if (isRealPlayer())
-#endif
-            HandleStealthedUnitsDetection();
-            m_DetectInvTimer = GetMap()->IsBattleGround() ? 500 : 2000;
-        }
-        else
-            m_DetectInvTimer -= diff;
-    }
-
     // Played time
     if (now > m_Last_tick)
     {
@@ -1735,7 +1732,12 @@ bool Player::BuildEnumData(QueryResult* result, WorldPacket& p_data)
     uint32 playerBytes2 = fields[6].GetUInt32();
     p_data << uint8(playerBytes2 & 0xFF);                  // facial hair
 
-    p_data << uint8(fields[7].GetUInt8());                 // level
+    uint32 atLoginFlags = fields[15].GetUInt32();
+
+    // a character that has never entered the world is sent at level 0, which shows as level 1;
+    // one created above level 1 keeps its level
+    uint8 level = fields[7].GetUInt8();
+    p_data << uint8((atLoginFlags & AT_LOGIN_FIRST) && level == 1 ? 0 : level); // level
     p_data << uint32(fields[8].GetUInt32());               // zone
     p_data << uint32(fields[9].GetUInt32());               // map
 
@@ -1747,7 +1749,6 @@ bool Player::BuildEnumData(QueryResult* result, WorldPacket& p_data)
 
     uint32 char_flags = 0;
     uint32 playerFlags = fields[14].GetUInt32();
-    uint32 atLoginFlags = fields[15].GetUInt32();
     if (playerFlags & PLAYER_FLAGS_HIDE_HELM)
         char_flags |= CHARACTER_FLAG_HIDE_HELM;
     if (playerFlags & PLAYER_FLAGS_HIDE_CLOAK)
@@ -2031,7 +2032,9 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
             if (!HasAtClient(currentTransport)) // in sniff, this aggregates all surroundings and sends them at once
             {
                 AddAtClient(currentTransport);
-                currentTransport->SendCreateUpdateToPlayer(this);
+                UpdateData data;
+                currentTransport->BuildCreateUpdateBlockForPlayer(data, this);
+                data.SendData(*GetSession());
             }
         }
 
@@ -2562,8 +2565,10 @@ void Player::SetGameMaster(bool on)
             deadUnit->ForceValuesUpdateAtIndex(UNIT_DYNAMIC_FLAGS);
     }
 
-    m_camera.UpdateVisibilityForOwner(true);
-    UpdateObjectVisibility();
+    UpdateData data;
+    m_camera.UpdateVisibilityForOwner(true, data);
+    data.SendData(*GetSession());
+    GetMap()->AddUpdateMovementObject(this);
     UpdateEverything();
 }
 
@@ -3761,7 +3766,7 @@ bool Player::resetTalents(bool no_cost)
 
         if (GetMoney() < cost)
         {
-            SendBuyError(BUY_ERR_NOT_ENOUGHT_MONEY, nullptr, 0, 0);
+            SendBuyError(BuyResult::NOT_ENOUGHT_MONEY, nullptr, 0);
             return false;
         }
     }
@@ -3864,7 +3869,7 @@ void Player::SaveItemToInventory(Item* item)
     item->SaveToDB();                                   // item have unchanged inventory record and can be save standalone
 }
 
-void Player::BuildCreateUpdateBlockForPlayer(UpdateData* data, Player* target) const
+void Player::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) const
 {
     if (target == this)
     {
@@ -4026,6 +4031,9 @@ TrainerSpellState Player::GetTrainerSpellState(TrainerSpell const* trainer_spell
  */
 void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRealmChars, bool deleteFinally)
 {
+    // the guid can come from a client packet: only its counter is trusted, whatever type its high part claims
+    playerguid = ObjectGuid(HIGHGUID_PLAYER, playerguid.GetCounter());
+
     // for nonexistent account avoid update realm
     if (accountId == 0)
         updateRealmChars = false;
@@ -4060,6 +4068,10 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
 
     // remove signs from petitions (also remove petitions if owner);
     RemovePetitionsAndSigns(playerguid);
+
+    // Sends mail, so it has to come before the transaction below
+    if (charDelete_method == 0)
+        sAuctionMgr.RemovePlayerAuctions(playerguid);
 
     switch (charDelete_method)
     {
@@ -4188,7 +4200,9 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             CharacterDatabase.PExecute("DELETE FROM character_action WHERE guid = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM character_aura WHERE guid = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM character_battleground_data WHERE guid = '%u'", lowguid);
-            CharacterDatabase.PExecute("DELETE FROM character_gifts WHERE guid = '%u'", lowguid);
+            // A gift it wrapped and already sent belongs to its receiver: only the ones it still holds go
+            CharacterDatabase.PExecute("DELETE FROM character_gifts WHERE guid = '%u' AND item_guid IN (SELECT guid FROM item_instance WHERE owner_guid = '%u')", lowguid, lowguid);
+            CharacterDatabase.PExecute("UPDATE character_gifts SET guid = 0 WHERE guid = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM character_homebind WHERE guid = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM character_instance WHERE guid = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM group_instance WHERE leaderGuid = '%u'", lowguid);
@@ -4204,6 +4218,27 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             CharacterDatabase.PExecute("DELETE FROM mail_items WHERE receiver = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM character_pet WHERE owner = '%u'", lowguid);
             CharacterDatabase.PExecute("DELETE FROM guild_eventlog WHERE PlayerGuid1 = '%u' OR PlayerGuid2 = '%u'", lowguid, lowguid);
+
+            // What other tables still keep of the character, so that nothing is left to name it
+            CharacterDatabase.PExecute("DELETE FROM character_account_data WHERE guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM character_stats WHERE guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM character_queststatus_weekly WHERE guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM character_honor_cp WHERE guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM character_forgotten_skills WHERE guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM item_loot WHERE owner_guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM pvpstats_players WHERE character_guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("DELETE FROM playerbot_saved_data WHERE guid = '%u'", lowguid);
+            // Auras it cast on others: caster_guid holds the full guid
+            CharacterDatabase.PExecute("DELETE FROM character_aura WHERE caster_guid = '" UI64FMTD "'", playerguid.GetRawValue());
+            CharacterDatabase.PExecute("DELETE FROM pet_aura WHERE caster_guid = '" UI64FMTD "'", playerguid.GetRawValue());
+            // Items it crafted that now belong to others. The gift creator is left alone: a wrapped item is
+            // recognised by a non-empty one.
+            CharacterDatabase.PExecute("UPDATE item_instance SET creatorGuid = 0 WHERE creatorGuid = '%u'", lowguid);
+            // GM tickets: its own are removed, the ones it handled as a GM go back to unassigned
+            CharacterDatabase.PExecute("DELETE FROM gm_tickets WHERE author_guid = '%u'", lowguid);
+            CharacterDatabase.PExecute("UPDATE gm_tickets SET assignee_guid = 0, assignee_name = '', status = CASE WHEN status = '%u' THEN '%u' ELSE status END "
+                                       "WHERE assignee_guid = '%u'", uint32(GMTICKET_ASSIGNEDTOGM_STATUS_ASSIGNED), uint32(GMTICKET_ASSIGNEDTOGM_STATUS_NOT_ASSIGNED), lowguid);
+            sTicketMgr.RemovePlayerReferences(playerguid);
             CharacterDatabase.CommitTransaction();
             break;
         }
@@ -4333,13 +4368,14 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
     m_deathTimer = 0;
 
     // update visibility of world around viewpoint
-    m_camera.UpdateVisibilityForOwner();
     // update visibility of player for nearby cameras
-    UpdateObjectVisibility();
-
     if (IsInWorld())
+    {
+        GetMap()->AddUpdateCreateObject(this);
+
         if (InstanceData* instanceData = GetMap()->GetInstanceData())
             instanceData->OnPlayerResurrect(this);
+    }
 
     if (!applySickness)
         return;
@@ -4431,9 +4467,6 @@ void Player::KillPlayer()
     UpdateCorpseReclaimDelay();                             // dependent at use SetDeathPvP() call before kill
 
     // don't create corpse at this moment, player might be falling
-
-    // update visibility
-    UpdateObjectVisibility();
 }
 
 Corpse* Player::CreateCorpse()
@@ -4465,7 +4498,9 @@ Corpse* Player::CreateCorpse()
     corpse->SetByteValue(CORPSE_FIELD_BYTES_2, 2, haircolor);
     corpse->SetByteValue(CORPSE_FIELD_BYTES_2, 3, facialhair);
 
-    uint32 flags = CORPSE_FLAG_UNK2;
+    uint32 flags = 0;
+    if (IsPvP())
+        flags |= CORPSE_FLAG_PVP;
     if (HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_HELM))
         flags |= CORPSE_FLAG_HIDE_HELM;
     if (HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_CLOAK))
@@ -4647,6 +4682,10 @@ uint32 Player::DurabilityRepair(uint16 pos, bool cost, float discountMod)
     if (!item)
         return TotalCost;
 
+    // a wrapped item shows no durability
+    if (item->HasFlag(ITEM_FIELD_FLAGS, ITEM_DYNFLAG_WRAPPED))
+        return TotalCost;
+
     uint32 maxDurability = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
     if (!maxDurability)
         return TotalCost;
@@ -4655,34 +4694,9 @@ uint32 Player::DurabilityRepair(uint16 pos, bool cost, float discountMod)
 
     if (cost)
     {
-        uint32 LostDurability = maxDurability - curDurability;
-        if (LostDurability > 0)
+        uint32 costs = item->CalculateDurabilityRepairCost(discountMod);
+        if (costs > 0)
         {
-            ItemPrototype const* ditemProto = item->GetProto();
-
-            DurabilityCostsEntry const* dcost = sDurabilityCostsStore.LookupEntry(ditemProto->ItemLevel);
-            if (!dcost)
-            {
-                sLog.outError("RepairDurability: Wrong item lvl %u", ditemProto->ItemLevel);
-                return TotalCost;
-            }
-
-            uint32 dQualitymodEntryId = (ditemProto->Quality + 1) * 2;
-            DurabilityQualityEntry const* dQualitymodEntry = sDurabilityQualityStore.LookupEntry(dQualitymodEntryId);
-            if (!dQualitymodEntry)
-            {
-                sLog.outError("RepairDurability: Wrong dQualityModEntry %u", dQualitymodEntryId);
-                return TotalCost;
-            }
-
-            uint32 dmultiplier = dcost->multiplier[ItemSubClassToDurabilityMultiplierId(ditemProto->Class, ditemProto->SubClass)];
-            uint32 costs = uint32(LostDurability * dmultiplier * double(dQualitymodEntry->quality_mod));
-
-            costs = uint32(costs * discountMod);
-
-            if (costs == 0)                                 // fix for ITEM_QUALITY_ARTIFACT
-                costs = 1;
-
             if (GetMoney() < costs)
             {
                 DEBUG_LOG("You do not have enough money");
@@ -6048,8 +6062,8 @@ bool Player::SetPosition(float x, float y, float z, float orientation, bool tele
         if (GetGroup() && (old_x != x || old_y != y))
             SetGroupUpdateFlag(GROUP_UPDATE_FLAG_POSITION);
 
-        if (GetTrader() && !IsWithinDistInMap(GetTrader(), INTERACTION_DISTANCE))
-            TradeCancel(true, TRADE_STATUS_TARGET_TO_FAR);
+        if (GetTrader() && !IsWithinDistInMap(GetTrader(), TRADE_DISTANCE, false))
+            TradeCancel(true);
 
         if (m_needsZoneUpdate)
         {
@@ -6795,6 +6809,10 @@ uint32 Player::GetLevelFromDB(ObjectGuid guid)
 
 void Player::UpdateArea(uint32 newArea)
 {
+    // group update
+    if (m_areaUpdateId != newArea && GetGroup())
+        SetGroupUpdateFlag(GROUP_UPDATE_FLAG_ZONE);
+
     m_areaUpdateId    = newArea;
 
     AreaTableEntry const* area = GetAreaEntryByAreaID(newArea);
@@ -6823,7 +6841,7 @@ bool Player::CanUseCapturePoint() const
            !HasStealthAura() &&                             // not stealthed
            !HasInvisibilityAura() &&                        // visible
            (IsPvP() || sWorld.IsPvPRealm()) &&
-           !HasMovementFlag(MOVEFLAG_FLYING) &&
+           !HasMovementFlag(MOVEFLAG_LEVITATING) &&
            !IsTaxiFlying() &&
            !IsGameMaster();
 }
@@ -6892,10 +6910,6 @@ void Player::UpdateZone(uint32 newZone, uint32 newArea, bool force)
 
     // recent client version not send leave/join channel packets for built-in local channels
     UpdateLocalChannels(newZone);
-
-    // group update
-    if (GetGroup())
-        SetGroupUpdateFlag(GROUP_UPDATE_FLAG_ZONE);
 
     UpdateZoneDependentAuras();
 }
@@ -9994,7 +10008,7 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
             if (IsInWorld() && update)
             {
                 pItem->AddToWorld();
-                pItem->SendCreateUpdateToPlayer(this);
+                GetMap()->AddUpdateCreateObject(pItem);
             }
 
             pItem->SetState(ITEM_CHANGED, this);
@@ -10005,7 +10019,7 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
             if (IsInWorld() && update)
             {
                 pItem->AddToWorld();
-                pItem->SendCreateUpdateToPlayer(this);
+                GetMap()->AddUpdateCreateObject(pItem);
             }
             pItem->SetState(ITEM_CHANGED, this);
             pBag->SetState(ITEM_CHANGED, this);
@@ -10025,7 +10039,9 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
 
     pItem2->SetCount(pItem2->GetCount() + count);
     if (IsInWorld() && update)
-        pItem2->SendCreateUpdateToPlayer(this);
+    {
+        GetMap()->AddUpdateObject(pItem2);
+    }
 
     if (!clone)
     {
@@ -10033,7 +10049,7 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
         if (IsInWorld() && update)
         {
             pItem->RemoveFromWorld();
-            pItem->DestroyForPlayer(this);
+            GetMap()->AddUpdateRemoveObject({ GetObjectGuid() }, pItem->GetObjectGuid());
         }
 
         RemoveEnchantmentDurations(pItem);
@@ -10111,7 +10127,7 @@ Item* Player::EquipItem(uint16 pos, Item* pItem, bool update)
         if (IsInWorld() && update)
         {
             pItem->AddToWorld();
-            pItem->SendCreateUpdateToPlayer(this);
+            GetMap()->AddUpdateCreateObject(pItem);
         }
 
         ApplyEquipCooldown(pItem);
@@ -10127,14 +10143,14 @@ Item* Player::EquipItem(uint16 pos, Item* pItem, bool update)
     {
         pItem2->SetCount(pItem2->GetCount() + pItem->GetCount());
         if (IsInWorld() && update)
-            pItem2->SendCreateUpdateToPlayer(this);
+        {
+            GetMap()->AddUpdateCreateObject(pItem2);
+        }
 
-        // delete item (it not in any slot currently)
-        // pItem->DeleteFromDB();
         if (IsInWorld() && update)
         {
             pItem->RemoveFromWorld();
-            pItem->DestroyForPlayer(this);
+            GetMap()->AddUpdateRemoveObject({ GetObjectGuid() }, pItem->GetObjectGuid());
         }
 
         RemoveEnchantmentDurations(pItem);
@@ -10165,7 +10181,7 @@ void Player::QuickEquipItem(uint16 pos, Item* pItem)
         if (IsInWorld())
         {
             pItem->AddToWorld();
-            pItem->SendCreateUpdateToPlayer(this);
+            GetMap()->AddUpdateCreateObject(pItem);
         }
     }
 }
@@ -10290,7 +10306,9 @@ void Player::RemoveItem(uint8 bag, uint8 slot, bool update)
         // pItem->SetGuidValue(ITEM_FIELD_OWNER, ObjectGuid()); not clear owner at remove (it will be set at store). This used in mail and auction code
         pItem->SetSlot(NULL_SLOT);
         if (IsInWorld() && update)
-            pItem->SendCreateUpdateToPlayer(this);
+        {
+            GetMap()->AddUpdateCreateObject(pItem);
+        }
     }
 }
 
@@ -10305,7 +10323,7 @@ void Player::MoveItemFromInventory(uint8 bag, uint8 slot, bool update)
         if (it->IsInWorld())
         {
             it->RemoveFromWorld();
-            it->DestroyForPlayer(this);
+            GetMap()->AddUpdateRemoveObject({ GetObjectGuid() }, it->GetObjectGuid());
         }
     }
 }
@@ -10402,7 +10420,7 @@ void Player::DestroyItem(uint8 bag, uint8 slot, bool update)
         if (IsInWorld() && update)
         {
             pItem->RemoveFromWorld();
-            pItem->DestroyForPlayer(this);
+            GetMap()->AddUpdateRemoveObject({ GetObjectGuid() }, pItem->GetObjectGuid());
         }
 
         // pItem->SetOwnerGUID(0);
@@ -10584,7 +10602,7 @@ void Player::DestroyItemCount(Item& item, uint32& count, bool update)
         item.SetCount(item.GetCount() - count);
         count = 0;
         if (IsInWorld() && update)
-            item.SendCreateUpdateToPlayer(this);
+            GetMap()->AddUpdateObject(&item);
         item.SetState(ITEM_CHANGED, this);
     }
 }
@@ -10650,7 +10668,7 @@ void Player::SplitItem(uint16 src, uint16 dst, uint32 count)
         }
 
         if (IsInWorld())
-            pSrcItem->SendCreateUpdateToPlayer(this);
+            GetMap()->AddUpdateObject(pSrcItem);
         pSrcItem->SetState(ITEM_CHANGED, this);
         StoreItem(dest, pNewItem, true);
     }
@@ -10671,7 +10689,7 @@ void Player::SplitItem(uint16 src, uint16 dst, uint32 count)
         }
 
         if (IsInWorld())
-            pSrcItem->SendCreateUpdateToPlayer(this);
+            GetMap()->AddUpdateObject(pSrcItem);
         pSrcItem->SetState(ITEM_CHANGED, this);
         BankItem(dest, pNewItem, true);
     }
@@ -10691,7 +10709,7 @@ void Player::SplitItem(uint16 src, uint16 dst, uint32 count)
         }
 
         if (IsInWorld())
-            pSrcItem->SendCreateUpdateToPlayer(this);
+            GetMap()->AddUpdateObject(pSrcItem);
         pSrcItem->SetState(ITEM_CHANGED, this);
         EquipItem(dest, pNewItem, true);
         AutoUnequipOffhandIfNeed();
@@ -10859,8 +10877,8 @@ void Player::SwapItem(uint16 src, uint16 dst)
                 pDstItem->SetState(ITEM_CHANGED, this);
                 if (IsInWorld())
                 {
-                    pSrcItem->SendCreateUpdateToPlayer(this);
-                    pDstItem->SendCreateUpdateToPlayer(this);
+                    GetMap()->AddUpdateObject(pSrcItem);
+                    GetMap()->AddUpdateObject(pDstItem);
                 }
             }
             return;
@@ -11066,7 +11084,11 @@ void Player::RemoveItemFromBuyBackSlot(uint32 slot, bool del)
         if (pItem)
         {
             pItem->RemoveFromWorld();
-            if (del) pItem->SetState(ITEM_REMOVED, this);
+            if (del)
+            {
+                GetMap()->AddUpdateRemoveObject({ GetObjectGuid() }, pItem->GetObjectGuid());
+                pItem->SetState(ITEM_REMOVED, this);
+            }
         }
 
         m_items[slot] = nullptr;
@@ -11119,26 +11141,22 @@ void Player::SendEquipError(InventoryResult msg, Item* pItem, Item* pItem2, uint
     GetSession()->SendPacket(data);
 }
 
-void Player::SendBuyError(BuyResult msg, Creature* pCreature, uint32 item, uint32 param) const
+void Player::SendBuyError(BuyResult msg, Creature* pCreature, uint32 vendorSlot) const
 {
     DEBUG_LOG("WORLD: Sent SMSG_BUY_FAILED");
     WorldPacket data(SMSG_BUY_FAILED, (8 + 4 + 4 + 1));
     data << (pCreature ? pCreature->GetObjectGuid() : ObjectGuid());
-    data << uint32(item);
-    if (param > 0)
-        data << uint32(param);
+    data << uint32(vendorSlot + 1);                 // numbered from 1 at client
     data << uint8(msg);
     GetSession()->SendPacket(data);
 }
 
-void Player::SendSellError(SellResult msg, Creature* pCreature, ObjectGuid itemGuid, uint32 param) const
+void Player::SendSellError(SellResult msg, Creature* pCreature, ObjectGuid itemGuid) const
 {
     DEBUG_LOG("WORLD: Sent SMSG_SELL_ITEM");
-    WorldPacket data(SMSG_SELL_ITEM, (8 + 8 + (param ? 4 : 0) + 1)); // last check 2.0.10
+    WorldPacket data(SMSG_SELL_ITEM, (8 + 8 + 1)); // last check 2.0.10
     data << (pCreature ? pCreature->GetObjectGuid() : ObjectGuid());
     data << ObjectGuid(itemGuid);
-    if (param > 0)
-        data << uint32(param);
     data << uint8(msg);
     GetSession()->SendPacket(data);
 }
@@ -13441,7 +13459,7 @@ void Player::RewardPlayerAndGroupAtEventExplored(uint32 questId, WorldObject con
         AreaExploredOrEventHappens(questId);
 }
 
-void Player::ItemAddedQuestCheck(uint32 entry, uint32 count)
+void Player::ItemAddedQuestCheck(uint32 entry, uint32 count, bool sendQuestUpdate)
 {
     for (int i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
     {
@@ -13473,7 +13491,8 @@ void Player::ItemAddedQuestCheck(uint32 entry, uint32 count)
                     if (q_status.uState != QUEST_NEW)
                         q_status.uState = QUEST_CHANGED;
 
-                    SendQuestUpdateAddItem(qInfo, j, curitemcount, additemcount);
+                    if (sendQuestUpdate)
+                        SendQuestUpdateAddItem(qInfo, j, curitemcount, additemcount);
                 }
 
                 if (CanCompleteQuest(questid))
@@ -17054,6 +17073,8 @@ void Player::HandleStealthedUnitsDetection()
 
     WorldObject const* viewPoint = GetCamera().GetBody();
 
+    UpdateData data;
+    std::vector<Unit*> added;
     for (UnitList::const_iterator i = stealthedUnits.begin(); i != stealthedUnits.end(); ++i)
     {
         Unit* target = *i;
@@ -17067,10 +17088,9 @@ void Player::HandleStealthedUnitsDetection()
         {
             if (!hasAtClient)
             {
-                ObjectGuid i_guid = (*i)->GetObjectGuid();
-                target->SendCreateUpdateToPlayer(this);
+                GetMap()->AddCreateAtClientObject(this, target);
                 AddAtClient((*i));
-
+                ObjectGuid i_guid = (*i)->GetObjectGuid();
                 DEBUG_FILTER_LOG(LOG_FILTER_VISIBILITY_CHANGES, "%s is detected in stealth by player %u. Distance = %f", i_guid.GetString().c_str(), GetGUIDLow(), GetDistance(*i));
             }
         }
@@ -17078,7 +17098,7 @@ void Player::HandleStealthedUnitsDetection()
         {
             if (hasAtClient)
             {
-                target->DestroyForPlayer(this);
+                GetMap()->AddUpdateRemoveObject({ GetObjectGuid()}, target->GetObjectGuid());
                 if (target->GetTypeId() == TYPEID_UNIT)
                     BeforeVisibilityDestroy(static_cast<Creature*>(target));
                 RemoveAtClient(target);
@@ -17185,7 +17205,7 @@ bool Player::ActivateTaxiPathTo(std::vector<uint32> const& nodes, Creature* npc 
     // stop trade (client cancel trade at taxi map open but cheating tools can be used for reopen it)
     TradeCancel(true);
 
-    if (!m_taxiTracker.AddRoutes(nodes, (npc ? GetReputationPriceDiscount(npc) : 0.0f), !spellid))
+    if (!m_taxiTracker.AddRoutes(nodes, (npc ? GetRepairPriceMultiplier(npc) : 0.0f), !spellid))
     {
         GetSession()->SendActivateTaxiReply(ERR_TAXIUNSPECIFIEDSERVERERROR);
         return false;
@@ -17531,6 +17551,30 @@ void Player::InitDisplayIds()
     }
 }
 
+bool Player::CanSeeVendorItem(Creature const* vendor, VendorItem const* vendorItem, ItemPrototype const* proto) const
+{
+    if (IsGameMaster())
+        return true;
+
+    // class wrong item skip only for bindable case
+    if ((proto->AllowableClass & getClassMask()) == 0 && proto->Bonding == BIND_WHEN_PICKED_UP)
+        return false;
+
+    // race wrong item skip always
+    if ((proto->AllowableRace & getRaceMask()) == 0)
+        return false;
+
+    // when no faction required but rank > 0 will be used faction id from the vendor faction template to compare the rank
+    if (!proto->RequiredReputationFaction && proto->RequiredReputationRank > 0 &&
+            ReputationRank(proto->RequiredReputationRank) > GetReputationRank(vendor->GetFactionTemplateEntry()->faction))
+        return false;
+
+    if (vendorItem->conditionId && !sObjectMgr.IsConditionSatisfied(vendorItem->conditionId, this, vendor->GetMap(), vendor, CONDITION_FROM_VENDOR))
+        return false;
+
+    return true;
+}
+
 // Return true is the bought item has a max count to force refresh of window by caller
 bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, uint8 bag, uint8 slot)
 {
@@ -17543,7 +17587,7 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
     ItemPrototype const* pProto = ObjectMgr::GetItemPrototype(item);
     if (!pProto)
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, nullptr, item, 0);
+        SendBuyError(BuyResult::CANT_FIND_ITEM, nullptr, 0);
         return false;
     }
 
@@ -17551,7 +17595,7 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
     if (!pCreature)
     {
         DEBUG_LOG("WORLD: BuyItemFromVendor - %s not found or you can't interact with him.", vendorGuid.GetString().c_str());
-        SendBuyError(BUY_ERR_DISTANCE_TOO_FAR, nullptr, item, 0);
+        SendBuyError(BuyResult::DISTANCE_TOO_FAR, nullptr, 0);
         return false;
     }
 
@@ -17559,7 +17603,7 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
     VendorItemData const* tItems = pCreature->GetVendorTemplateItems();
     if ((!vItems || vItems->Empty()) && (!tItems || tItems->Empty()))
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, pCreature, item, 0);
+        SendBuyError(BuyResult::CANT_FIND_ITEM, pCreature, 0);
         return false;
     }
 
@@ -17572,14 +17616,21 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
 
     if (vendorslot >= vCount + tCount)
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, pCreature, item, 0);
+        SendBuyError(BuyResult::CANT_FIND_ITEM, pCreature, 0);
         return false;
     }
 
     VendorItem const* crItem = vendorslot < vCount ? vItems->GetItem(vendorslot) : tItems->GetItem(vendorslot - vCount);
     if (!crItem || crItem->item != item)                    // store diff item (cheating)
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, pCreature, item, 0);
+        SendBuyError(BuyResult::CANT_FIND_ITEM, pCreature, vendorslot);
+        return false;
+    }
+
+    // hidden from this player in the vendor list (cheating)
+    if (!CanSeeVendorItem(pCreature, crItem, pProto))
+    {
+        SendBuyError(BuyResult::CANT_FIND_ITEM, pCreature, vendorslot);
         return false;
     }
 
@@ -17590,7 +17641,7 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
     {
         if (pCreature->GetVendorItemCurrentCount(crItem) < totalCount)
         {
-            SendBuyError(BUY_ERR_ITEM_ALREADY_SOLD, pCreature, item, 0);
+            SendBuyError(BuyResult::ITEM_ALREADY_SOLD, pCreature, vendorslot);
             return false;
         }
     }
@@ -17601,20 +17652,14 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
 
     if (uint32(GetReputationRank(reqFaction)) < pProto->RequiredReputationRank)
     {
-        SendBuyError(BUY_ERR_REPUTATION_REQUIRE, pCreature, item, 0);
+        SendBuyError(BuyResult::REPUTATION_REQUIRE, pCreature, vendorslot);
         return false;
     }
 
     // not check level requiremnt for normal items (PvP related bonus items is another case)
     if (pProto->RequiredHonorRank && (GetHonorHighestRankInfo().rank < (uint8)pProto->RequiredHonorRank || GetLevel() < pProto->RequiredLevel))
     {
-        SendBuyError(BUY_ERR_RANK_REQUIRE, pCreature, item, 0);
-        return false;
-    }
-
-    if (crItem->conditionId && !IsGameMaster() && !sObjectMgr.IsConditionSatisfied(crItem->conditionId, this, pCreature->GetMap(), pCreature, CONDITION_FROM_VENDOR))
-    {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, pCreature, item, 0);
+        SendBuyError(BuyResult::RANK_REQUIRE, pCreature, vendorslot);
         return false;
     }
 
@@ -17625,7 +17670,7 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
 
     if (GetMoney() < price)
     {
-        SendBuyError(BUY_ERR_NOT_ENOUGHT_MONEY, pCreature, item, 0);
+        SendBuyError(BuyResult::NOT_ENOUGHT_MONEY, pCreature, vendorslot);
         return false;
     }
 
@@ -17643,7 +17688,12 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
 
         ModifyMoney(-int32(price));
 
-        pItem = StoreNewItem(dest, item, true);
+        // the client shows the quest item progress from SMSG_BUY_ITEM
+        if (Item* newItem = Item::CreateItem(item, totalCount, this))
+        {
+            ItemAddedQuestCheck(item, totalCount, false);
+            pItem = StoreItem(dest, newItem, true);
+        }
     }
     else if (IsEquipmentPos(bag, slot))
     {
@@ -17663,7 +17713,12 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
 
         ModifyMoney(-int32(price));
 
-        pItem = EquipNewItem(dest, item, true);
+        // the client shows the quest item progress from SMSG_BUY_ITEM
+        if (Item* newItem = Item::CreateItem(item, 1, this))
+        {
+            ItemAddedQuestCheck(item, 1, false);
+            pItem = EquipItem(dest, newItem, true);
+        }
 
         if (pItem)
             AutoUnequipOffhandIfNeed();
@@ -17683,7 +17738,7 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
     data << pCreature->GetObjectGuid();
     data << uint32(vendorslot + 1);                 // numbered from 1 at client
     data << uint32(crItem->maxcount > 0 ? new_count : 0xFFFFFFFF);
-    data << uint32(count);
+    data << uint32(totalCount);
     GetSession()->SendPacket(data);
 
     SendNewItem(pItem, totalCount, true, false);
@@ -17859,10 +17914,18 @@ void Player::AddAtClient(WorldObject* target)
     target->AddClientIAmAt(this);
 }
 
-void Player::RemoveAtClient(WorldObject* target)
+void Player::RemoveAtClient(WorldObject* target, bool skipRemovalOfAt)
 {
     m_clientGUIDs.erase(target->GetObjectGuid());
-    target->RemoveClientIAmAt(this);
+    if (!skipRemovalOfAt)
+        target->RemoveClientIAmAt(this);
+}
+
+void Player::DestroyAtClient(WorldObject* target, bool skipRemovalOfAt)
+{
+    target->DestroyForPlayer(this);
+
+    RemoveAtClient(target, skipRemovalOfAt);
 }
 
 bool Player::IsVisibleInGridForPlayer(Player* pl) const
@@ -17937,7 +18000,7 @@ void Player::BeforeVisibilityDestroy(Creature* creature)
         static_cast<Pet*>(creature)->Unsummon(PET_SAVE_REAGENTS);
 }
 
-void Player::UpdateVisibilityOf(WorldObject const* viewPoint, WorldObject* target)
+void Player::UpdateVisibilityOf(WorldObject const* viewPoint, WorldObject* target, UpdateData& updateData)
 {
     if (HasAtClient(target))
     {
@@ -17945,10 +18008,11 @@ void Player::UpdateVisibilityOf(WorldObject const* viewPoint, WorldObject* targe
         {
             ObjectGuid t_guid = target->GetObjectGuid();
 
-            if (target->GetTypeId() == TYPEID_UNIT)
+            if (target->IsCreature())
                 BeforeVisibilityDestroy(static_cast<Creature*>(target));
 
-            target->DestroyForPlayer(this);
+            GetMap()->AddUpdateRemoveObject({ this->GetObjectGuid() }, target->GetObjectGuid());
+
             RemoveAtClient(target);
 
             DEBUG_FILTER_LOG(LOG_FILTER_VISIBILITY_CHANGES, "UpdateVisibilityOf: %s out of range for player %u. Distance = %f", t_guid.GetString().c_str(), GetGUIDLow(), GetDistance(target));
@@ -17958,9 +18022,8 @@ void Player::UpdateVisibilityOf(WorldObject const* viewPoint, WorldObject* targe
     {
         if (target->isVisibleForInState(this, viewPoint, false))
         {
-            target->SendCreateUpdateToPlayer(this);
-            if (target->GetTypeId() != TYPEID_GAMEOBJECT || !((GameObject*)target)->IsMoTransport())
-                AddAtClient(target);
+            target->BuildCreateUpdateBlockForPlayer(updateData, this);
+            AddAtClient(target);
 
             DEBUG_FILTER_LOG(LOG_FILTER_VISIBILITY_CHANGES, "UpdateVisibilityOf: %s is visible now for player %u. Distance = %f", target->GetGuidStr().c_str(), GetGUIDLow(), GetDistance(target));
         }
@@ -17970,13 +18033,7 @@ void Player::UpdateVisibilityOf(WorldObject const* viewPoint, WorldObject* targe
 template<class T>
 inline void UpdateVisibilityOf_helper(GuidSet& s64, T* target)
 {
-    s64.insert(target->GetObjectGuid());
-}
-
-template<>
-inline void UpdateVisibilityOf_helper(GuidSet& s64, GameObject* target)
-{
-    if (!target->IsMoTransport())
+    if (!target->GetVisibilityData().IsInfiniteVisibility())
         s64.insert(target->GetObjectGuid());
 }
 
@@ -17992,7 +18049,7 @@ void Player::UpdateVisibilityOf(WorldObject const* viewPoint, T* target, UpdateD
             if (target->GetTypeId() == TYPEID_UNIT)
                 BeforeVisibilityDestroy(dynamic_cast<Creature*>(target));
 
-            target->BuildOutOfRangeUpdateBlock(&data);
+            target->BuildOutOfRangeUpdateBlock(data);
             RemoveAtClient(target);
 
             DEBUG_FILTER_LOG(LOG_FILTER_VISIBILITY_CHANGES, "UpdateVisibilityOf(TemplateV): %s is out of range for %s. Distance = %f", t_guid.GetString().c_str(), GetGuidStr().c_str(), GetDistance(target));
@@ -18003,7 +18060,7 @@ void Player::UpdateVisibilityOf(WorldObject const* viewPoint, T* target, UpdateD
         if (target->isVisibleForInState(this, viewPoint, false))
         {
             visibleNow.insert(target);
-            target->BuildCreateUpdateBlockForPlayer(&data, this);
+            target->BuildCreateUpdateBlockForPlayer(data, this);
             AddAtClient(target);
 
             DEBUG_FILTER_LOG(LOG_FILTER_VISIBILITY_CHANGES, "UpdateVisibilityOf(TemplateV): %s is visible now for %s. Distance = %f", target->GetGuidStr().c_str(), GetGuidStr().c_str(), GetDistance(target));
@@ -18427,6 +18484,25 @@ float Player::GetReputationPriceDiscount(FactionTemplateEntry const* vendor_fact
     return float (discount / 100.0f);
 }
 
+float Player::GetRepairPriceMultiplier(Creature const* vendor) const
+{
+    double discount = 0.0;
+    if (vendor->GetReactionTo(this) >= REP_HONORED)
+        discount = double(0.1f);
+
+    if (vendor->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PVP))
+    {
+        uint8 honorRank = GetByteValue(PLAYER_BYTES_3, 3);
+        if (honorRank >= 6)
+        {
+            discount += double(0.05f);
+            if (honorRank >= 8)
+                discount += double(0.05f);
+        }
+    }
+    return float(1.0 - discount);
+}
+
 /**
  * Check spell availability for training base at SkillLineAbility/SkillRaceClassInfo data.
  * Checked allowed race/class and dependent from race/class allowed min level
@@ -18538,11 +18614,7 @@ void Player::UpdateForQuestWorldObjects()
                     obj->BuildValuesUpdateBlockForPlayerWithFlags(updateData, this, UF_FLAG_DYNAMIC);
         }
     }
-    for (size_t i = 0; i < updateData.GetPacketCount(); ++i)
-    {
-        WorldPacket packet = updateData.BuildPacket(i);
-        GetSession()->SendPacket(packet);
-    }
+    updateData.SendData(*GetSession());
 }
 
 void Player::UpdateEverything()
@@ -18553,7 +18625,7 @@ void Player::UpdateEverything()
     UpdateData updateData;
     for (const auto guid : m_clientGUIDs)
         if (WorldObject* obj = GetMap()->GetWorldObject(guid))
-            obj->BuildForcedValuesUpdateBlockForPlayer(&updateData, this);
+            obj->BuildForcedValuesUpdateBlockForPlayer(updateData, this);
 
     updateData.SendData(*GetSession());
 }

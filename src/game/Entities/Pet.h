@@ -107,7 +107,8 @@ enum ActionFeedback
     FEEDBACK_NONE            = 0,
     FEEDBACK_PET_DEAD        = 1,
     FEEDBACK_NOTHING_TO_ATT  = 2,
-    FEEDBACK_CANT_ATT_TARGET = 3
+    FEEDBACK_CANT_ATT_TARGET = 3,
+    FEEDBACK_NO_PATH         = 4,
 };
 
 enum PetTalk
@@ -174,7 +175,7 @@ class Pet : public Creature
         Position GetPetSpawnPosition(Player* owner);
         bool isLoading() const { return m_loading; }
         void SetLoading(bool state) { m_loading = state; }
-        void Unsummon(PetSaveMode mode, Unit* owner = nullptr);
+        void Unsummon(PetSaveMode mode, Unit* owner = nullptr, bool removeList = true);
         static void DeleteFromDB(uint32 guidlow, bool separate_transaction = true);
         static void DeleteFromDB(Unit* owner, PetSaveMode slot);
         static SpellCastResult TryLoadFromDB(Unit* owner, uint32 petentry = 0, uint32 petnumber = 0, bool current = false, PetType mandatoryPetType = MAX_PET_TYPE);

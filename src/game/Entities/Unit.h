@@ -1069,6 +1069,15 @@ struct SelectAttackingTargetParams
 
 struct SpellProcEventEntry;                                 // used only privately
 
+enum SwingErrors
+{
+    SWING_ERROR_NONE,
+    SWING_ERROR_NOT_IN_RANGE,
+    SWING_ERROR_TARGET_NOT_ALIVE,
+    SWING_ERROR_BAD_FACING,
+    SWING_ERROR_CANT_ATTACK_TARGET,
+};
+
 class Unit : public WorldObject
 {
     public:
@@ -1298,7 +1307,7 @@ class Unit : public WorldObject
         bool HasBreakableByDamageCrowdControlAura(Unit* excludeCasterChannel = nullptr, uint32 excludeAuraApplyMSTimeCutoff = 0) const;
         bool HasBreakableByDamageAuraType(AuraType type, uint32 excludeAura, uint32 excludeAuraApplyMSTimeCutoff) const;
         bool HasAuraPetShouldAvoidBreaking(Unit* excludeCasterChannel = nullptr, uint32 excludeAuraApplyMSTimeCutoff = 0) const;
-        void SendMeleeAttackStop(const Unit& victim) const;
+        void SendMeleeAttackStop(Unit const* victim) const;
         void SendMeleeAttackStart(const Unit& victim) const;
 
         void addUnitState(uint32 f) { m_state |= f; }
@@ -1649,6 +1658,7 @@ class Unit : public WorldObject
             return m_spellAuraHolders.find(spellId) != m_spellAuraHolders.end();
         }
         bool HasAuraTypeWithCaster(AuraType auratype, ObjectGuid caster) const;
+        bool HasPeriodicAura() const;
         bool HasMechanicMaskOrDispelMaskAura(uint32 dispelMask, uint32 mechanicMask, Unit const* caster) const;
         bool HasNegativeAuraWithInterruptFlag(SpellAuraInterruptFlags flag) const;
         template<typename Func>
@@ -2353,7 +2363,7 @@ class Unit : public WorldObject
         virtual bool CanFly() const = 0;
         virtual bool CanWalk() const = 0;
         virtual bool CanBeDetected() const { return true; }
-        virtual bool IsFlying() const { return m_movementInfo.HasMovementFlag(MOVEFLAG_FLYING); }
+        virtual bool IsFlying() const { return m_movementInfo.HasMovementFlag(MOVEFLAG_LEVITATING); }
 
         void ForceHealthAndPowerUpdate();   // force server to send new value for hp and power (including max)
 
@@ -2429,6 +2439,9 @@ class Unit : public WorldObject
 
         uint32 GetDamageDoneByOthers() { return m_damageByOthers; }
         uint32 GetModifierXpBasedOnDamageReceived(uint32 xp);
+
+        void UpdateNextUpdateTime() override;
+        uint32 ShouldPerformObjectUpdate(uint32 const diff) override;
 
         void UpdateSplinePosition(bool relocateOnly = false);
         void SendFlightSplineSyncIfNeeded();
@@ -2609,6 +2622,7 @@ class Unit : public WorldObject
         Position m_last_notified_position;
         BasicEvent* m_AINotifyEvent;
         ShortTimeTracker m_movesplineTimer;
+        bool m_hasPeriodicAura;
 
         Diminishing m_Diminishing;
 

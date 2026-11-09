@@ -146,7 +146,7 @@ Creature::Creature(CreatureSubtype subtype) : Unit(),
     m_isInvisible(false), m_ignoreMMAP(false), m_forceAttackingCapability(false),
     m_settings(this),
     m_countSpawns(false),
-    m_creatureGroup(nullptr), m_imposedCooldown(false), m_healthMultiplier(1.f), m_damageMultiplier(1.f), m_baseAP(0), m_baseRAP(0),
+    m_creatureGroup(nullptr), m_imposedCooldown(false), m_delayedPetSpells(false), m_healthMultiplier(1.f), m_damageMultiplier(1.f), m_baseAP(0), m_baseRAP(0),
     m_creatureInfo(nullptr), m_mountInfo(nullptr),
     m_combatOnlyStealth(false)
 {
@@ -157,6 +157,8 @@ Creature::Creature(CreatureSubtype subtype) : Unit(),
 
 Creature::~Creature()
 {
+    if (GetVisibilityData().IsLargeVisibility())
+        printf("");
     CleanupsBeforeDelete();
 }
 
@@ -271,7 +273,6 @@ void Creature::RemoveCorpse(bool inPlace)
 
     m_corpseExpirationTime = TimePoint();
     SetDeathState(DEAD);
-    UpdateObjectVisibility();
 
     delete m_loot;
     m_loot = nullptr;
@@ -303,14 +304,17 @@ void Creature::RemoveCorpse(bool inPlace)
     GetRespawnCoord(x, y, z, &o);
     GetMap()->CreatureRelocation(this, x, y, z, o);
 
-    // forced recreate creature object at clients
-    UnitVisibility currentVis = GetVisibility();
-    SetVisibility(VISIBILITY_REMOVE_CORPSE);
-    UpdateObjectVisibility();
-    SetVisibility(currentVis);                              // restore visibility state
-    UpdateObjectVisibility();
-
-    if (IsUsingNewSpawningSystem())
+    if (!IsUsingNewSpawningSystem()) // schedule out of range
+    {
+        auto& clientGuids = GetClientGuidsIAmAt();
+        for (auto& clientGuid : clientGuids)
+            if (Player* client = GetMap()->GetPlayer(clientGuid))
+                client->RemoveAtClient(this, true);
+        GetMap()->AddUpdateRemoveObject(GetClientGuidsIAmAt(), GetObjectGuid());
+        clientGuids.clear();
+        GetClientGuidsIAmAt().clear();
+    }
+    else
         AddObjectToRemoveList();
 }
 
@@ -775,6 +779,9 @@ void Creature::Update(const uint32 diff)
             // Creature can be dead after unit update
             if (IsAlive())
                 RegenerateAll(diff);
+
+            if (m_delayedPetSpells && !ItsNewObject()) // after being added to world
+                TriggerDelayedPetSpells();
 
             break;
         }
@@ -1599,8 +1606,26 @@ void Creature::SetMountInfo(CreatureInfo const* info)
     m_mountInfo = info;
 }
 
+void Creature::TriggerDelayedPetSpells()
+{
+    Player* player = const_cast<Player*>(GetControllingPlayer());
+    if (!player)
+        return;
+
+    player->SetCharm(this);                                    // save guid of charmed creature
+    player->UpdateClientControl(this, true, true);             // transfer client control to the creature after altering flags
+    player->PossessSpellInitialize();                          // TODO: Meant to be after update object with the uf flag
+
+    ForceValuesUpdateForFlag(UF_FLAG_OWNER_ONLY);
+
+    m_delayedPetSpells = false;
+}
+
 bool Creature::CreateFromProto(uint32 dbGuid, uint32 guidlow, CreatureInfo const* cinfo, const CreatureData* data /*=nullptr*/, GameEventCreatureData const* eventData /*=nullptr*/)
 {
+    if (!guidlow)                                           // no free map guid counter, already logged
+        return false;
+
     m_originalEntry = cinfo->Entry;
 
     uint32 newEntry = cinfo->Entry;
@@ -1669,7 +1694,7 @@ bool Creature::LoadFromDB(uint32 dbGuid, Map* map, uint32 newGuid, uint32 forced
     }
 
     if (dynguid || newGuid == 0)
-        newGuid = map->GenerateLocalLowGuid(cinfo->GetHighGuid());
+        newGuid = map->GenerateLocalLowGuid(cinfo->GetHighGuid(), cinfo->Entry);
 
     CreatureCreatePos pos(map, data->posX, data->posY, data->posZ, data->orientation);
 
@@ -3096,6 +3121,14 @@ void Creature::RegisterHitBySpell(uint32 spellId)
 void Creature::ResetSpellHitCounter()
 {
     m_hitBySpells.clear();
+}
+
+uint32 Creature::GetNextUpdateTime()
+{
+    if (!HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED) && m_deathState != ALIVE)
+        return 500;
+
+    return WorldObject::GetNextUpdateTime();
 }
 
 void Creature::Heartbeat()

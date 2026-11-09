@@ -80,7 +80,12 @@ void Pet::RemoveFromWorld()
 {
     ///- Remove the pet from the accessor
     if (IsInWorld())
+    {
+        if (!m_removed && !IsPlayerControlled())
+            Unsummon(PET_SAVE_NOT_IN_SLOT, nullptr, false);
+
         GetMap()->GetObjectsStore().erase<Pet>(GetObjectGuid(), (Pet*)nullptr);
+    }
 
     ///- Don't call the function for Creature, normal mobs + totems go in a different storage
     Unit::RemoveFromWorld();
@@ -241,7 +246,7 @@ bool Pet::LoadPetFromDB(Player* owner, Position const& spawnPos, uint32 petentry
 
     CreatureCreatePos pos(owner->GetMap(), spawnPos.x, spawnPos.y, spawnPos.z, spawnPos.o);
 
-    uint32 guid = pos.GetMap()->GenerateLocalLowGuid(HIGHGUID_PET);
+    uint32 guid = pos.GetMap()->GenerateLocalLowGuid(HIGHGUID_PET, pet_number);
     if (!Create(guid, pos, creatureInfo, pet_number))
     {
         return false;
@@ -989,9 +994,11 @@ int32 Pet::GetDispTP() const
         return -(m_TrainingPoints + 1);
 }
 
-void Pet::Unsummon(PetSaveMode mode, Unit* owner /*= nullptr*/)
+void Pet::Unsummon(PetSaveMode mode, Unit* owner /*= nullptr*/, bool removeList /*= true*/)
 {
     MANGOS_ASSERT(!m_removed);
+
+    m_removed = true;
 
     if (!owner)
         owner = GetOwner();
@@ -1080,8 +1087,8 @@ void Pet::Unsummon(PetSaveMode mode, Unit* owner /*= nullptr*/)
             SavePetToDB(mode, p_owner);
     }
 
-    AddObjectToRemoveList();
-    m_removed = true;
+    if (removeList)
+        AddObjectToRemoveList();
 }
 
 void Pet::GivePetXP(uint32 xp)
@@ -1150,10 +1157,9 @@ bool Pet::CreateBaseAtCreature(Creature* creature)
 
     CreatureCreatePos pos(creature, creature->GetOrientation());
 
-    uint32 guid = creature->GetMap()->GenerateLocalLowGuid(HIGHGUID_PET);
-
     BASIC_LOG("Create pet");
     uint32 pet_number = sObjectMgr.GeneratePetNumber();
+    uint32 guid = creature->GetMap()->GenerateLocalLowGuid(HIGHGUID_PET, pet_number);
     if (!Create(guid, pos, creature->GetCreatureInfo(), pet_number))
         return false;
 
@@ -2108,6 +2114,9 @@ void Pet::ToggleAutocast(uint32 spellid, bool apply)
 bool Pet::Create(uint32 guidlow, CreatureCreatePos& cPos, CreatureInfo const* cinfo, uint32 pet_number)
 {
     SetMap(cPos.GetMap());
+
+    if (!guidlow)                                           // no free map guid counter, already logged
+        return false;
 
     Object::_Create(guidlow, guidlow, pet_number, HIGHGUID_PET);
 
