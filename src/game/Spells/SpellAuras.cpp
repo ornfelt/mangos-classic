@@ -379,9 +379,9 @@ Aura* CreateAura(SpellEntry const* spellproto, SpellEffectIndex eff, int32 const
     return aura;
 }
 
-SpellAuraHolder* CreateSpellAuraHolder(SpellEntry const* spellproto, Unit* target, WorldObject* caster, Item* castItem /*= nullptr*/, SpellEntry const* triggeredBy /*= nullptr*/)
+SpellAuraHolder* CreateSpellAuraHolder(SpellEntry const* spellproto, Unit* target, WorldObject* caster, ObjectGuid castItemGuid /*= ObjectGuid()*/, SpellEntry const* triggeredBy /*= nullptr*/)
 {
-    return new SpellAuraHolder(spellproto, target, caster, castItem, triggeredBy);
+    return new SpellAuraHolder(spellproto, target, caster, castItemGuid, triggeredBy);
 }
 
 void Aura::SetModifier(AuraType type, int32 amount, uint32 periodicTime, int32 miscValue)
@@ -2227,7 +2227,9 @@ void Aura::HandleModPossess(bool apply, bool Real)
 
         caster->TakePossessOf(target);
 
-        if (Player* playerCaster = caster->IsPlayer() ? static_cast<Player*>(caster) : nullptr)
+        // a creation not written yet carries the values
+        Player* playerCaster = caster->IsPlayer() ? static_cast<Player*>(caster) : nullptr;
+        if (playerCaster && !playerCaster->IsCreationPending(target))
         {
             UpdateData newData;
             target->BuildValuesUpdateBlockForPlayerWithFlags(newData, playerCaster, UF_FLAG_OWNER_ONLY);
@@ -2312,7 +2314,7 @@ void Aura::HandleModCharm(bool apply, bool Real)
 
         caster->TakeCharmOf(target, GetId());
 
-        if (playerCaster)
+        if (playerCaster && !playerCaster->IsCreationPending(target)) // a creation not written yet carries the values
         {
             UpdateMask updateMask;
             updateMask.SetCount(target->GetValuesCount());
@@ -4696,8 +4698,8 @@ void Aura::PeriodicTick()
             if (!pCaster)
                 break;
 
-            // don't heal target if max health or if not alive, mostly death persistent effects from items
-            if (!target->IsAlive() || (target->GetHealth() == target->GetMaxHealth()))
+            // don't heal target if not alive, mostly death persistent effects from items
+            if (!target->IsAlive())
                 break;
 
             // heal for caster damage (must be alive)
@@ -5153,9 +5155,9 @@ inline bool IsRemovedOnShapeshiftLost(SpellEntry const* spellproto, ObjectGuid c
     /*TODO: investigate spellid 24864  or (SpellFamilyName = 7 and EffectApplyAuraName_1 = 49 and stances = 0)*/
 }
 
-SpellAuraHolder::SpellAuraHolder(SpellEntry const* spellproto, Unit* target, WorldObject* caster, Item* castItem, SpellEntry const* triggeredBy) :
+SpellAuraHolder::SpellAuraHolder(SpellEntry const* spellproto, Unit* target, WorldObject* caster, ObjectGuid castItemGuid, SpellEntry const* triggeredBy) :
     m_spellProto(spellproto), m_target(target),
-    m_castItemGuid(castItem ? castItem->GetObjectGuid() : ObjectGuid()), m_triggeredBy(triggeredBy),
+    m_castItemGuid(castItemGuid), m_triggeredBy(triggeredBy),
     m_spellAuraHolderState(SPELLAURAHOLDER_STATE_CREATED), m_auraSlot(MAX_AURAS),
     m_auraLevel(1), m_procCharges(0),
     m_stackAmount(1), m_timeCla(1000), m_removeMode(AURA_REMOVE_BY_DEFAULT),

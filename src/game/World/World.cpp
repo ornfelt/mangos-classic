@@ -685,7 +685,7 @@ void World::LoadConfigSettings(bool reload)
     setConfig(CONFIG_UINT32_CHAT_STRICT_LINK_CHECKING_KICK,     "ChatStrictLinkChecking.Kick", 0);
 
     setConfig(CONFIG_BOOL_CORPSE_EMPTY_LOOT_SHOW,                     "Corpse.EmptyLootShow",                  true);
-    setConfig(CONFIG_BOOL_CORPSE_ALLOW_ALL_ITEMS_SHOW_IN_MASTER_LOOT, "Corpse.AllowAllItemsShowInMasterLoot", false);
+    setConfig(CONFIG_BOOL_CORPSE_ALLOW_ALL_ITEMS_SHOW_IN_MASTER_LOOT, "Corpse.AllowAllItemsShowInMasterLoot", true);
     setConfig(CONFIG_UINT32_CORPSE_DECAY_NORMAL,                      "Corpse.Decay.NORMAL",                    300);
     setConfig(CONFIG_UINT32_CORPSE_DECAY_RARE,                        "Corpse.Decay.RARE",                      900);
     setConfig(CONFIG_UINT32_CORPSE_DECAY_ELITE,                       "Corpse.Decay.ELITE",                     600);
@@ -1439,10 +1439,6 @@ void World::SetInitialWorldSettings()
     // update metrics output every second
     m_timers[WUPDATE_METRICS].SetInterval(1 * IN_MILLISECONDS);
 #endif // BUILD_METRICS
-
-#ifdef BUILD_DEPRECATED_PLAYERBOT
-    PlayerbotMgr::SetInitialWorldSettings();
-#endif
 
 #ifdef ENABLE_PLAYERBOTS
     sPlayerbotAIConfig.Initialize();

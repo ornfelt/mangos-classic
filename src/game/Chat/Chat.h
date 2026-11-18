@@ -279,6 +279,7 @@ class ChatHandler
         bool LootStatsHelper(char* args, bool full);
         bool HandleLootStatsCommand(char* args);
         bool HandleLootFullStatsCommand(char* args);
+        bool HandleLootShowCommand(char* args);
 
         bool HandleDebugOverflowCommand(char* args);
         bool HandleDebugChatFreezeCommand(char* args);
@@ -482,7 +483,6 @@ class ChatHandler
         bool HandleNpcPlayEmoteCommand(char* args);
         bool HandleNpcSayCommand(char* args);
         bool HandleNpcListSpells(char* args);
-        bool HandleNpcShowLootCommand(char* args);
         bool HandleNpcSetModelCommand(char* args);
         bool HandleNpcSetMoveTypeCommand(char* args);
         bool HandleNpcSpawnDistCommand(char* args);
@@ -753,9 +753,6 @@ class ChatHandler
         bool HandleStableCommand(char* args);
         bool HandleWaterwalkCommand(char* args);
         bool HandleQuitCommand(char* args);
-#ifdef BUILD_DEPRECATED_PLAYERBOT
-        bool HandlePlayerbotCommand(char* args);
-#endif
 
 #ifdef ENABLE_PLAYERBOTS
         bool HandlePlayerbotCommand(char* args);

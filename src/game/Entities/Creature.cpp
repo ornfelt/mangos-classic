@@ -305,15 +305,7 @@ void Creature::RemoveCorpse(bool inPlace)
     GetMap()->CreatureRelocation(this, x, y, z, o);
 
     if (!IsUsingNewSpawningSystem()) // schedule out of range
-    {
-        auto& clientGuids = GetClientGuidsIAmAt();
-        for (auto& clientGuid : clientGuids)
-            if (Player* client = GetMap()->GetPlayer(clientGuid))
-                client->RemoveAtClient(this, true);
-        GetMap()->AddUpdateRemoveObject(GetClientGuidsIAmAt(), GetObjectGuid());
-        clientGuids.clear();
-        GetClientGuidsIAmAt().clear();
-    }
+        ScheduleOutOfRangeOnClientsIAmAt();
     else
         AddObjectToRemoveList();
 }
@@ -758,9 +750,6 @@ void Creature::Update(const uint32 diff)
         case CORPSE:
         {
             Unit::Update(diff);
-
-            if (m_loot)
-                m_loot->Update();
 
             if (IsCorpseExpired())
                 RemoveCorpse();
@@ -1652,16 +1641,20 @@ bool Creature::LoadFromDB(uint32 dbGuid, Map* map, uint32 newGuid, uint32 forced
             return false;
     }
 
-    uint32 entry = forcedEntry ? forcedEntry : data->id;
+    uint32 entry = forcedEntry;
 
     SpawnGroupEntry* groupEntry = map->GetMapDataContainer().GetSpawnGroupByGuid(dbGuid, TYPEID_UNIT); // use dynguid by default \o/
     CreatureGroup* group = nullptr;
     if (groupEntry)
     {
         group = static_cast<CreatureGroup*>(map->GetSpawnManager().GetSpawnGroup(groupEntry->Id));
+        // a member loaded with its grid takes the entry its group chose for it, as when the group spawns it
         if (!entry)
             entry = group->GetGuidEntry(dbGuid);
     }
+
+    if (!entry)
+        entry = data->id;
 
     // get data for dual spawn instances - spawn group precedes it because
     if (entry == 0)
@@ -2202,7 +2195,9 @@ void Creature::CallAssistance(Unit* enemy)
 
 std::pair<bool, GuidVector> Creature::MarkCallAssistanceOnPull(Unit* enemy)
 {
-    bool stored = m_AlreadyCallAssistance;
+    if (m_AlreadyCallAssistance)
+        return {false, GuidVector()};
+
     SetNoCallAssistance(true);
 
     if (!CanCallForAssistance())
@@ -2219,7 +2214,7 @@ std::pair<bool, GuidVector> Creature::MarkCallAssistanceOnPull(Unit* enemy)
     GuidVector guids;
     for (Creature* creature : receiverList)
         guids.push_back(creature->GetObjectGuid());
-    return {stored, guids};
+    return {true, guids};
 }
 
 void Creature::CallAssistanceOnPull(Unit* enemy, GuidVector const& receiverList)

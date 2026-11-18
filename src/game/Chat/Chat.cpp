@@ -440,6 +440,7 @@ ChatCommand* ChatHandler::getCommandTable()
     {
         { "stats",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleLootStatsCommand,           "", nullptr },
         { "fullstats",      SEC_GAMEMASTER,     true,  &ChatHandler::HandleLootFullStatsCommand,       "", nullptr },
+        { "show",           SEC_GAMEMASTER,     false, &ChatHandler::HandleLootShowCommand,            "", nullptr },
 
         { nullptr,          0,                  false, nullptr,                                        "", nullptr }
     };
@@ -554,7 +555,6 @@ ChatCommand* ChatHandler::getCommandTable()
         { "whisper",        SEC_MODERATOR,      false, &ChatHandler::HandleNpcWhisperCommand,          "", nullptr },
         { "yell",           SEC_MODERATOR,      false, &ChatHandler::HandleNpcYellCommand,             "", nullptr },
         { "tame",           SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcTameCommand,             "", nullptr },
-        { "showloot",       SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcShowLootCommand,         "", nullptr },
         { "tempspawn",      SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcTempSpawn,               "", nullptr },
         { "evade",          SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcEvade,                   "", nullptr },
         { "despawn",        SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcDespawn,                 "", nullptr },
@@ -1013,9 +1013,6 @@ ChatCommand* ChatHandler::getCommandTable()
         { "mmap",           SEC_GAMEMASTER,     false, nullptr,                                        "", mmapCommandTable },
         { "worldstate",     SEC_ADMINISTRATOR,  false, nullptr,                                        "", worldStateTable },
         { "loot",           SEC_GAMEMASTER,     true,  nullptr,                                        "", lootCommandTable },
-#ifdef BUILD_DEPRECATED_PLAYERBOT
-        { "bot",            SEC_PLAYER,         false, &ChatHandler::HandlePlayerbotCommand,           "", nullptr },
-#endif
         { nullptr,          0,                  false, nullptr,                                        "", nullptr }
     };
 
@@ -2867,7 +2864,8 @@ GameObject* ChatHandler::GetGameObjectWithGuid(uint32 lowguid, uint32 entry) con
 
     Player* pl = m_session->GetPlayer();
 
-    return pl->GetMap()->GetGameObject(ObjectGuid(HIGHGUID_GAMEOBJECT, entry, lowguid));
+    GameObjectInfo const* goInfo = ObjectMgr::GetGameObjectInfo(entry);
+    return pl->GetMap()->GetGameObject(ObjectGuid(goInfo ? goInfo->GetHighGuid() : HIGHGUID_GAMEOBJECT, entry, lowguid));
 }
 
 enum SpellLinkType
@@ -3001,7 +2999,10 @@ ObjectGuid ChatHandler::ExtractGuidFromLink(char** text)
                 return ObjectGuid();
 
             if (GameObjectData const* data = sObjectMgr.GetGOData(lowguid))
-                return ObjectGuid(HIGHGUID_GAMEOBJECT, data->id, lowguid);
+            {
+                GameObjectInfo const* goInfo = ObjectMgr::GetGameObjectInfo(data->id);
+                return ObjectGuid(goInfo ? goInfo->GetHighGuid() : HIGHGUID_GAMEOBJECT, data->id, lowguid);
+            }
             return ObjectGuid();
         }
     }

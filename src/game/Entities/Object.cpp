@@ -30,6 +30,8 @@
 #include "Entities/UpdateData.h"
 #include "Entities/UpdateMask.h"
 #include "Entities/Transports.h"
+#include "Maps/TransportMgr.h"
+#include "Movement/MoveSpline.h"
 #include "Util/Util.h"
 #include "Grids/CellImpl.h"
 #include "Grids/GridNotifiers.h"
@@ -130,23 +132,6 @@ void Object::SetObjectScale(float newScale)
     SetFloatValue(OBJECT_FIELD_SCALE_X, newScale);
 }
 
-void Object::SendForcedObjectUpdate()
-{
-    if (!m_inWorld || !m_objectUpdated)
-        return;
-
-    UpdateDataMapType update_players;
-
-    BuildUpdateData(update_players);
-    RemoveFromClientUpdateList();
-
-    // here we allocate a std::vector with a size of 0x10000
-    for (auto& update_player : update_players)
-    {
-        update_player.second.SendData(*update_player.first->GetSession());
-    }
-}
-
 void Object::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) const
 {
     if (!target)
@@ -189,22 +174,51 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData& data, Player* target) c
     buf << GetPackGUID();
     buf << uint8(m_objectTypeId);
 
-    BuildMovementUpdate(&buf, updateFlags);
+    BuildMovementUpdate(&buf, updateFlags, target);
     UpdateMask updateMask;
     updateMask.SetCount(m_valuesCount);
     _SetCreateBits(updateMask, target);
     BuildValuesUpdate(updatetype, &buf, &updateMask, target);
     data.AddUpdateBlock(buf, GetObjectGuid().IsTransport() || GetObjectGuid().IsMOTransport());
+
+    // the movement block of an elevator is off its position (see GetElevatorCreateOffset): restore the exact one right after
+    if (m_objectTypeId == TYPEID_GAMEOBJECT && static_cast<GameObject const*>(this)->GetGOInfo()->type == GAMEOBJECT_TYPE_TRANSPORT)
+    {
+        UpdateMask posMask;
+        posMask.SetCount(m_valuesCount);
+        posMask.SetBit(GAMEOBJECT_POS_X);
+        posMask.SetBit(GAMEOBJECT_POS_Y);
+        posMask.SetBit(GAMEOBJECT_POS_Z);
+        BuildValuesUpdateBlockForPlayer(data, posMask, target);
+    }
 }
 
-void Object::BuildValuesUpdateBlockForPlayer(UpdateData& data, Player* target) const
+void Object::ChangedValuesWriter::WriteFor(Player* client)
 {
-    UpdateMask updateMask;
-    updateMask.SetCount(m_valuesCount);
+    if (!m_fieldsListed)
+    {
+        m_fieldsListed = true;
+        for (uint16 index = 0; index < m_object.m_valuesCount; ++index)
+            if (m_object.m_changedValues[index])
+                m_changedFields.push_back(index);
+        if (!m_changedFields.empty())
+            m_visibleFields.SetCount(m_object.m_valuesCount);
+    }
 
-    _SetUpdateBits(updateMask, target);
-    if (updateMask.HasData())
-        BuildValuesUpdateBlockForPlayer(data, updateMask, target);
+    if (m_changedFields.empty())
+        return;
+
+    uint16 const* flags = nullptr;
+    uint16 const visibleFlag = m_object.GetUpdateFieldFlagsForTarget(client, flags);
+    MANGOS_ASSERT(flags);
+
+    m_visibleFields.Clear();
+    for (uint16 index : m_changedFields)
+        if (flags[index] & visibleFlag)
+            m_visibleFields.SetBit(index);
+
+    if (m_visibleFields.HasData())
+        m_object.BuildValuesUpdateBlockForPlayer(client->GetClientUpdate(), m_visibleFields, client);
 }
 
 void Object::BuildValuesUpdateBlockForPlayerWithFlags(UpdateData& data, Player* target, UpdateFieldFlags flags) const
@@ -244,11 +258,6 @@ void Object::BuildForcedValuesUpdateBlockForPlayer(UpdateData& data, Player* tar
     data.AddUpdateBlock(buf, GetObjectGuid().IsTransport() || GetObjectGuid().IsMOTransport());
 }
 
-void Object::BuildOutOfRangeUpdateBlock(UpdateData& data) const
-{
-    data.AddOutOfRangeGUID(GetObjectGuid());
-}
-
 void Object::DestroyForPlayer(Player* target) const
 {
     MANGOS_ASSERT(target);
@@ -258,7 +267,29 @@ void Object::DestroyForPlayer(Player* target) const
     target->GetSession()->SendPacket(data);
 }
 
-void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags) const
+// The client places the collision of an elevator only at a tick where the elevator is away from the position it got at creation,
+// so a stopped elevator would stay without collision and its passengers would fall through it. Its create block puts it 1 cm off,
+// on an axis its path never uses, and a values block right after gives back the exact position: the first tick places it.
+static void GetElevatorCreateOffset(GameObject const* go, float& dx, float& dz)
+{
+    dx = 0.0f;
+    dz = 0.0f;
+    if (go->GetGOInfo()->type != GAMEOBJECT_TYPE_TRANSPORT)
+        return;
+    TransportAnimation const* anim = sTransportMgr.GetTransportAnimInfo(go->GetGOInfo()->id);
+    if (!anim)
+        return;
+    bool movesZ = false;
+    for (auto const& node : anim->Path)
+        if (node.second->Z != 0.0f)
+            movesZ = true;
+    if (movesZ)
+        dx = 0.01f;
+    else
+        dz = 0.01f;
+}
+
+void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags, Player const* target) const
 {
     Unit const* unit = nullptr;
     uint32 highGuid = 0;
@@ -288,7 +319,8 @@ void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags) const
     if (updateFlags & UPDATEFLAG_LIVING)
     {
         MANGOS_ASSERT(unit);
-        if (unit->IsStopped() && unit->m_movementInfo.HasMovementFlag(MOVEFLAG_SPLINE_ENABLED))
+        // IsStopped() is true during a taxi flight, which still runs a spline
+        if (unit->m_movementInfo.HasMovementFlag(MOVEFLAG_SPLINE_ENABLED) && unit->movespline->Finalized())
         {
             sLog.outError("%s is not moving but have spline movement enabled!", GetGuidStr().c_str());
             ((Unit*)this)->m_movementInfo.RemoveMovementFlag(MovementFlags(MOVEFLAG_SPLINE_ENABLED | MOVEFLAG_FORWARD));
@@ -319,9 +351,11 @@ void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags) const
         if (updateFlags & UPDATEFLAG_TRANSPORT)
         {
             GameObject const* go = static_cast<GameObject const*>(this);
-            *data << float(go->GetStationaryX());
+            float dx, dz;
+            GetElevatorCreateOffset(go, dx, dz);
+            *data << float(go->GetStationaryX() + dx);
             *data << float(go->GetStationaryY());
-            *data << float(go->GetStationaryZ());
+            *data << float(go->GetStationaryZ() + dz);
             *data << float(go->GetStationaryO());
         }
         else
@@ -350,11 +384,13 @@ void Object::BuildMovementUpdate(ByteBuffer* data, uint8 updateFlags) const
 
     if (updateFlags & UPDATEFLAG_TRANSPORT)
     {
-        GameObject const* go = static_cast<GameObject const*>(this);
-        if (go && go->IsTransport())
-            *data << uint32(static_cast<GenericTransport const*>(go)->GetPathProgress());
-        else
-            *data << uint32(go->GetMap()->GetCurrentMSTime());
+        // the client takes this time as the transport time at the moment it gets the packet: it is given the time the
+        // packet arrives at this client
+        WorldObject const* wo = static_cast<WorldObject const*>(this);
+        uint32 transportTime = wo->GetMap()->GetCurrentMSTime();
+        if (target)
+            transportTime += target->GetSession()->GetOneWayDelay();
+        *data << uint32(transportTime);
     }
 }
 
@@ -396,7 +432,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
     // 2 specialized loops for speed optimization in non-unit case
     if (isType(TYPEMASK_UNIT))                              // unit (creature/player) case
     {
-        for (uint16 index = 0; index < m_valuesCount; ++index)
+        for (uint32 index = updateMask->GetNextSetBit(0); index < updateMask->GetCount(); index = updateMask->GetNextSetBit(index + 1))
         {
             if (updateMask->GetBit(index))
             {
@@ -615,7 +651,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
     }
     else if (isType(TYPEMASK_CORPSE))                       // corpse case
     {
-        for (uint16 index = 0; index < m_valuesCount; ++index)
+        for (uint32 index = updateMask->GetNextSetBit(0); index < updateMask->GetCount(); index = updateMask->GetNextSetBit(index + 1))
         {
             if (updateMask->GetBit(index))
             {
@@ -648,7 +684,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
     }
     else if (isType(TYPEMASK_GAMEOBJECT))                   // gameobject case
     {
-        for (uint16 index = 0; index < m_valuesCount; ++index)
+        for (uint32 index = updateMask->GetNextSetBit(0); index < updateMask->GetCount(); index = updateMask->GetNextSetBit(index + 1))
         {
             if (updateMask->GetBit(index))
             {
@@ -689,7 +725,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
     }
     else                                                    // other objects case (no special index checks)
     {
-        for (uint16 index = 0; index < m_valuesCount; ++index)
+        for (uint32 index = updateMask->GetNextSetBit(0); index < updateMask->GetCount(); index = updateMask->GetNextSetBit(index + 1))
         {
             if (updateMask->GetBit(index))
             {
@@ -703,10 +739,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
 void Object::ClearUpdateMask(bool remove)
 {
     if (m_uint32Values)
-    {
-        for (uint16 index = 0; index < m_valuesCount; ++index)
-            m_changedValues[index] = false;
-    }
+        std::fill(m_changedValues.begin(), m_changedValues.end(), false);
 
     if (m_objectUpdated)
     {
@@ -792,17 +825,6 @@ void Object::MarkUpdateFieldsWithFlagForUpdate(UpdateMask& updateMask, uint16 fl
         if (GetUInt32Value(index) != 0 && (flags[index] & flag))
             updateMask.SetBit(index);
     }
-}
-
-void Object::_SetUpdateBits(UpdateMask& updateMask, Player* target) const
-{
-    uint16 const* flags = nullptr;
-    uint16 visibleFlag = GetUpdateFieldFlagsForTarget(target, flags);
-    MANGOS_ASSERT(flags);
-
-    for (uint16 index = 0; index < m_valuesCount; ++index)
-        if (m_changedValues[index] && (flags[index] & visibleFlag))
-            updateMask.SetBit(index);
 }
 
 void Object::_SetCreateBits(UpdateMask& updateMask, Player* target) const
@@ -1055,48 +1077,6 @@ bool Object::PrintEntryError(char const* descr) const
     return false;
 }
 
-
-void Object::BuildUpdateDataForPlayer(Player* pl, UpdateDataMapType& update_players) const
-{
-    UpdateDataMapType::iterator iter = update_players.find(pl);
-
-    if (iter == update_players.end())
-    {
-        std::pair<UpdateDataMapType::iterator, bool> p = update_players.insert(UpdateDataMapType::value_type(pl, UpdateData()));
-        MANGOS_ASSERT(p.second);
-        iter = p.first;
-    }
-
-    BuildValuesUpdateBlockForPlayer(iter->second, iter->first);
-}
-
-void Object::BuildCreateDataForPlayer(Player* player, UpdateDataMapType& update_players, bool /*auras*/) const
-{
-    UpdateDataMapType::iterator iter = update_players.find(player);
-
-    if (iter == update_players.end())
-    {
-        std::pair<UpdateDataMapType::iterator, bool> p = update_players.insert(UpdateDataMapType::value_type(player, UpdateData()));
-        MANGOS_ASSERT(p.second);
-        iter = p.first;
-    }
-
-    BuildCreateUpdateBlockForPlayer(iter->second, iter->first);
-}
-
-void Object::BuildOutOfRangeDataForPlayer(Player* pl, UpdateDataMapType& update_players, ObjectGuid oorObject)
-{
-    UpdateDataMapType::iterator iter = update_players.find(pl);
-
-    if (iter == update_players.end())
-    {
-        std::pair<UpdateDataMapType::iterator, bool> p = update_players.insert(UpdateDataMapType::value_type(pl, UpdateData()));
-        MANGOS_ASSERT(p.second);
-        iter = p.first;
-    }
-
-    iter->second.AddOutOfRangeGUID(oorObject);
-}
 
 void Object::AddToClientUpdateList()
 {
@@ -2506,14 +2486,11 @@ void WorldObject::RemoveFromClientUpdateList()
     GetMap()->RemoveUpdateObject(this);
 }
 
+// Clients around an object that start seeing it
 struct WorldObjectCreateAccumulator
 {
     WorldObject& i_object;
-    PlayerSet i_playerSet;
-    WorldObjectCreateAccumulator(WorldObject& obj) : i_object(obj)
-    {
-
-    }
+    explicit WorldObjectCreateAccumulator(WorldObject& obj) : i_object(obj) {}
 
     void Visit(CameraMapType& m)
     {
@@ -2521,43 +2498,31 @@ struct WorldObjectCreateAccumulator
         {
             Player* owner = iter.getSource()->GetOwner();
 #ifdef ENABLE_PLAYERBOTS
-            if (owner->isRealPlayer())
-            {
+            if (!owner->isRealPlayer())
+                continue;
 #endif
-                if (owner != &i_object)
-                {
-                    if (!owner->HasAtClient(&i_object))
-                    {
-                        if (i_object.isVisibleForInState(owner, owner->GetCamera().GetBody(), false))
-                        {
-                            owner->AddAtClient(&i_object);
-                            i_playerSet.insert(owner);
-                        }
-                    }
-                }
-#ifdef ENABLE_PLAYERBOTS
-            }
-#endif
+            if (owner != &i_object && !owner->HasAtClient(&i_object) && i_object.isVisibleForInState(owner, owner->GetCamera().GetBody(), false))
+                owner->ScheduleCreate(&i_object);
         }
     }
 
     template<class SKIP> void Visit(GridRefManager<SKIP>&) {}
 };
 
-void WorldObject::BuildUpdateData(UpdateDataMapType& update_players)
+void WorldObject::BuildUpdateData()
 {
     if (ItsNewObject())
         GetMap()->AddCameraToWorld(this);
 
-    if (IsPlayer())
-        BuildUpdateDataForPlayer((Player*)this, update_players);
+    ChangedValuesWriter values(*this);
 
-    for (auto& iter : m_clientGUIDsIAmAt)
-    {
-        if (Player* player = GetMap()->GetPlayer(iter))
-            if (player != this && player->HasAtClient(this))
-                BuildUpdateDataForPlayer(player, update_players);
-    }
+    if (IsPlayer())
+        values.WriteFor(static_cast<Player*>(this));
+
+    for (ObjectGuid const& guid : m_clientGUIDsIAmAt)
+        if (Player* client = GetMap()->GetPlayer(guid))
+            if (client != this && !client->IsCreationPending(this)) // a creation not written yet carries all the values
+                values.WriteFor(client);
 
     ClearUpdateMask(false);
 
@@ -2565,37 +2530,57 @@ void WorldObject::BuildUpdateData(UpdateDataMapType& update_players)
         SetItsNewObject(false);
 }
 
-void WorldObject::UpdateVisibility(UpdateDataMapType& update_players)
+void WorldObject::SendForcedObjectUpdate()
+{
+    if (!IsInWorld() || !m_objectUpdated)
+        return;
+
+    BuildUpdateData();
+    RemoveFromClientUpdateList();
+
+    if (IsPlayer())
+        static_cast<Player*>(this)->SendClientUpdate();
+
+    for (ObjectGuid const& guid : m_clientGUIDsIAmAt)
+        if (Player* client = GetMap()->GetPlayer(guid))
+            client->SendClientUpdate();
+}
+
+void WorldObject::UpdateVisibility()
 {
     if (ItsNewObject())
         GetMap()->AddCameraToWorld(this);
 
-    GetViewPoint().Call_UpdateVisibilityForOwner(update_players);
+    // what the players looking through this object see
+    GetViewPoint().Call_UpdateVisibilityForOwner();
 
-    GuidSet oor;
-    for (auto itr = m_clientGUIDsIAmAt.begin(); itr != m_clientGUIDsIAmAt.end(); )
+    // the clients that stop seeing this object, then the ones that start
+    for (auto itr = m_clientGUIDsIAmAt.begin(); itr != m_clientGUIDsIAmAt.end();)
     {
-        if (Player* client = GetMap()->GetPlayer(*itr))
-        {
-            if (!this->isVisibleForInState(client, client->GetCamera().GetBody(), false))
-            {
-                client->RemoveAtClient(this, true);
-                oor.insert(*itr);
-                itr = m_clientGUIDsIAmAt.erase(itr);
-                continue;
-            }
-        }
-
-        ++itr;
+        Player* client = GetMap()->GetPlayer(*itr);
+        ++itr;                                              // ScheduleOutOfRange takes the client off the list
+        if (client && !isVisibleForInState(client, client->GetCamera().GetBody(), true))
+            client->ScheduleOutOfRange(this);
     }
-
-    if (!oor.empty())
-        GetMap()->AddUpdateRemoveObject(oor, this->GetObjectGuid());
 
     WorldObjectCreateAccumulator notifier(*this);
     Cell::VisitWorldObjects(this, notifier, GetVisibilityData().GetVisibilityDistance());
-    GetMap()->AddCreateAtClientObjects(notifier.i_playerSet, this);
-    ClearUpdateMask(false);
+}
+
+uint32 WorldObject::GetCarrierDepth() const
+{
+    uint32 const maxDepth = 8;                              // carriers never loop, the bound only protects the server
+    uint32 depth = 0;
+    WorldObject const* passenger = this;
+    while (depth < maxDepth)
+    {
+        WorldObject const* carrier = passenger->GetTransport();
+        if (!carrier)
+            break;
+        passenger = carrier;
+        ++depth;
+    }
+    return depth;
 }
 
 bool WorldObject::IsControlledByPlayer() const
@@ -2758,7 +2743,7 @@ bool WorldObject::GetExpireTime(SpellEntry const& spellEntry, TimePoint& expireT
     return false;
 }
 
-bool WorldObject::IsSpellReady(SpellEntry const& spellEntry, ItemPrototype const* itemProto /*= nullptr*/) const
+bool WorldObject::IsSpellReady(SpellEntry const& spellEntry, ItemPrototype const* itemProto /*= nullptr*/, bool itemCategoryOnly /*= false*/) const
 {
     uint32 spellCategory = spellEntry.Category;
 
@@ -2772,13 +2757,15 @@ bool WorldObject::IsSpellReady(SpellEntry const& spellEntry, ItemPrototype const
         return false;
 
     // overwrite category by provided category in item prototype during item cast if need
+    // item category 0 keeps the spell category, unless only the item category is checked
     if (itemProto)
     {
         for (const auto& Spell : itemProto->Spells)
         {
             if (Spell.SpellId == spellEntry.Id)
             {
-                spellCategory = Spell.SpellCategory;
+                if (Spell.SpellCategory || itemCategoryOnly)
+                    spellCategory = Spell.SpellCategory;
                 break;
             }
         }
@@ -3166,11 +3153,21 @@ void WorldObject::DestroyOnClientsIAmAt()
 {
     if (IsInWorld())
     {
-        for (ObjectGuid guid : m_clientGUIDsIAmAt)
+        GuidSet clients;
+        std::swap(clients, m_clientGUIDsIAmAt);             // DestroyAtClient takes each client off the list
+        for (ObjectGuid const& guid : clients)
             if (Player* player = GetMap()->GetPlayer(guid))
-                player->DestroyAtClient(this, true);
-        m_clientGUIDsIAmAt.clear();
+                player->DestroyAtClient(this);
     }
+}
+
+void WorldObject::ScheduleOutOfRangeOnClientsIAmAt()
+{
+    GuidSet clients;
+    std::swap(clients, m_clientGUIDsIAmAt);                 // ScheduleOutOfRange takes each client off the list
+    for (ObjectGuid const& guid : clients)
+        if (Player* client = GetMap()->GetPlayer(guid))
+            client->ScheduleOutOfRange(this);
 }
 
 bool WorldObject::CheckAndIncreaseCastCounter()
