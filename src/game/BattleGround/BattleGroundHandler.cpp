@@ -32,6 +32,10 @@
 #include "AI/ScriptDevAI/ScriptDevAIMgr.h"
 #include "World/World.h"
 
+#if defined(USE_CUSTOM_CHANGES) && defined(ENABLE_PLAYERBOTS)
+#include "Custom/BattleGroundBotFill.h"
+#endif
+
 // Sent by client when player talk to the battle master
 void WorldSession::HandleBattlemasterHelloOpcode(WorldPacket& recv_data)
 {
@@ -179,6 +183,10 @@ void WorldSession::HandleBattlemasterJoinOpcode(WorldPacket& recv_data)
         }
     }
     // if we're here, then the conditions to join a bg are met. We can proceed in joining.
+
+#if defined(USE_CUSTOM_CHANGES) && defined(ENABLE_PLAYERBOTS)
+    sBattleGroundBotFill.OnQueueJoin(_player, bgQueueTypeId);
+#endif
 
     // _player->GetGroup() was already checked, group is already initialized
     AddGroupToQueueInfo info;
